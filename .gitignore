@@ -1,0 +1,6 @@
+secrets.yaml
+.esphome/
+**/.esphome/
+desktop.ini
+__pycache__/
+*.csv

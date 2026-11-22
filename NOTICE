@@ -1,0 +1,11 @@
+MitM Deye - safer rewrite
+
+Based on Psynosaur/MitM-Deye (https://github.com/Psynosaur/MitM-Deye),
+itself based on Adminius/mitpylon (https://github.com/Adminius/mitpylon).
+Licensed under the Apache License, Version 2.0.
+
+Modifications: deye-mitm.yaml, mitm/mitm_deye.h, mitm/mitm_limits.h and
+test/mitm-cantest.yaml are new or rewritten files (2026). The original
+mitmdeye.yaml is replaced by deye-mitm.yaml. connection.png and the Deye
+protocol PDF from the original are moved to docs/; the Home Assistant
+screenshots in docs/ are new.

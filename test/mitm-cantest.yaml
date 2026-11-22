@@ -1,0 +1,100 @@
+# Bench test for the Deye MitM hardware (ESP32-C6 Super Mini + 2x SN65HVD230).
+# No WiFi, log over USB only. Flash with:  esphome run mitm-cantest.yaml --device <your serial port>
+#
+# Every second:
+#   BMS side      (GPIO0 TX / GPIO1 RX) sends std ID 0x101, data B1 <counter> 00 00 00 00 00 00
+#   Inverter side (GPIO20 TX / GPIO19 RX) sends std ID 0x202, data A2 <counter> 00 00 00 00 00 00
+# Everything either controller receives is logged as "RX BMS-side" / "RX INV-side".
+# "TX ... FAILED" in the log = no ACK on that bus (nobody listening, wiring, S pin, or bit rate).
+# Same pins as deye-mitm.yaml. 500 kbps like the Deye PCS bus.
+
+substitutions:
+  bms_tx: GPIO0
+  bms_rx: GPIO1
+  inv_tx: GPIO20
+  inv_rx: GPIO19
+
+esphome:
+  name: mitm-cantest
+  # build_path: C:/esphb/mitm-cantest   # on Windows: a short path, ESP-IDF dislikes long paths
+
+esp32:
+  board: esp32-c6-devkitm-1
+  framework:
+    type: esp-idf
+
+logger:
+  level: DEBUG
+  hardware_uart: USB_SERIAL_JTAG
+  logs:
+    canbus: INFO          # hide ESPHome's own per-frame debug lines, we log our own
+
+globals:
+  - id: cnt
+    type: uint8_t
+    initial_value: "0"
+  - id: tx_ok
+    type: uint32_t
+    initial_value: "0"
+  - id: tx_fail
+    type: uint32_t
+    initial_value: "0"
+
+canbus:
+  - platform: esp32_can
+    id: bms_can
+    tx_pin: ${bms_tx}
+    rx_pin: ${bms_rx}
+    can_id: 0x7FF
+    bit_rate: 500KBPS
+    on_frame:
+      - can_id: 0
+        can_id_mask: 0
+        then:
+          - lambda: |-
+              ESP_LOGI("test", "RX BMS-side std 0x%03X [%u] %s", (unsigned) can_id, (unsigned) x.size(),
+                       format_hex_pretty(x).c_str());
+      - can_id: 0
+        can_id_mask: 0
+        use_extended_id: true
+        then:
+          - lambda: |-
+              ESP_LOGI("test", "RX BMS-side ext 0x%08X [%u] %s", (unsigned) can_id, (unsigned) x.size(),
+                       format_hex_pretty(x).c_str());
+
+  - platform: esp32_can
+    id: inv_can
+    tx_pin: ${inv_tx}
+    rx_pin: ${inv_rx}
+    can_id: 0x7FF
+    bit_rate: 500KBPS
+    on_frame:
+      - can_id: 0
+        can_id_mask: 0
+        then:
+          - lambda: |-
+              ESP_LOGI("test", "RX INV-side std 0x%03X [%u] %s", (unsigned) can_id, (unsigned) x.size(),
+                       format_hex_pretty(x).c_str());
+      - can_id: 0
+        can_id_mask: 0
+        use_extended_id: true
+        then:
+          - lambda: |-
+              ESP_LOGI("test", "RX INV-side ext 0x%08X [%u] %s", (unsigned) can_id, (unsigned) x.size(),
+                       format_hex_pretty(x).c_str());
+
+interval:
+  - interval: 1s
+    then:
+      - lambda: |-
+          id(cnt)++;
+          std::vector<uint8_t> b = {0xB1, id(cnt), 0, 0, 0, 0, 0, 0};
+          std::vector<uint8_t> a = {0xA2, id(cnt), 0, 0, 0, 0, 0, 0};
+          auto eb = id(bms_can)->send_data(0x101, false, b);
+          auto ea = id(inv_can)->send_data(0x202, false, a);
+          if (eb == canbus::ERROR_OK) id(tx_ok)++; else id(tx_fail)++;
+          if (ea == canbus::ERROR_OK) id(tx_ok)++; else id(tx_fail)++;
+          ESP_LOGI("test", "TX BMS-side 0x101 #%u %s | TX INV-side 0x202 #%u %s | ok=%u fail=%u",
+                   id(cnt), eb == canbus::ERROR_OK ? "ok" : "FAILED",
+                   id(cnt), ea == canbus::ERROR_OK ? "ok" : "FAILED",
+                   (unsigned) id(tx_ok), (unsigned) id(tx_fail));

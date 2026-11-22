@@ -1,0 +1,521 @@
+# Deye PCS CAN man-in-the-middle (BMS <-> ESP32-C6 <-> inverter)
+# See README.md for wiring, safety notes and what every entity does.
+#
+# Rules this firmware follows:
+#  - forwards EVERY frame in both directions (any number of packs; 0x305 heartbeat reaches the BMS)
+#  - only 0x351, 0x371 and 0x35C may be changed, and only DOWNWARDS (min of BMS value and your setting)
+#  - SOC and everything else pass through untouched
+#  - a BMS force-charge request always overrides your charge settings
+#  - "MitM active" OFF (default on first boot) = pure pass-through
+#  - no frames from the BMS = nothing is sent = inverter sees "BMS lost" (fail-safe)
+#
+# Files: this file, plus mitm/mitm_deye.h and mitm/mitm_limits.h next to it.
+# secrets.yaml needs: wifi_ssid, wifi_password, api_key_mitm, ota_password_mitm, ap_password_mitm
+# (see secrets.example.yaml)
+
+substitutions:
+  name: deye-mitm
+  # ESP32-C6 Super Mini pins (spares: GPIO2, 3, 18, 21, 22, 23)
+  # Avoid: GPIO4/5/8/9/15 (strapping, RGB LED, BOOT, LED), 12/13 (USB), 16/17 (UART0)
+  # BMS side (battery "PCS" port)
+  bms_tx: GPIO0
+  bms_rx: GPIO1
+  # Inverter side (inverter "BMS" port)
+  inv_tx: GPIO20
+  inv_rx: GPIO19
+  max_current: "400"           # slider range, A (system limit for up to 8 packs)
+
+esphome:
+  name: ${name}
+  friendly_name: Deye MitM
+  includes:
+    - mitm/mitm_deye.h
+    - mitm/mitm_limits.h
+
+esp32:
+  board: esp32-c6-devkitm-1
+  framework:
+    type: esp-idf
+
+logger:
+  level: INFO
+  logs:
+    canbus: INFO
+
+api:
+  encryption:
+    key: !secret api_key_mitm
+
+ota:
+  - platform: esphome
+    password: !secret ota_password_mitm
+
+wifi:
+  # use_address: 192.168.1.50       # optional: set if your dashboard cannot resolve deye-mitm.local
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "Deye-MitM Fallback Hotspot"
+    password: !secret ap_password_mitm
+
+captive_portal:
+
+canbus:
+  # ---------------- BMS side ----------------
+  - platform: esp32_can
+    id: bms_can
+    tx_pin: ${bms_tx}
+    rx_pin: ${bms_rx}
+    can_id: 0x7FF                # unused, every frame is sent with its original ID
+    bit_rate: 500KBPS
+    rx_queue_len: 64
+    tx_queue_len: 64
+    tx_enqueue_timeout: 5ms
+    on_frame:
+      - can_id: 0
+        can_id_mask: 0           # every 11-bit frame from the BMS
+        then:
+          - lambda: |-
+              auto &s = mitm::state();
+              s.last_bms_ms = millis();
+              s.from_bms++;
+              std::vector<uint8_t> d = x;
+              const mitm::Limits L = mitm_limits();
+              const bool mod = mitm::apply(can_id, d, L);
+              if (mod) s.modified++;
+              const auto e = id(inverter_can)->send_data(can_id, false, d);
+              if (e != canbus::ERROR_OK) s.tx_errors++;
+              if (id(log_frames).state) {
+                ESP_LOGI("bms>inv", "0x%03X %s%s%s", (unsigned) can_id, format_hex_pretty(x).c_str(),
+                         mod ? "  => " : "", mod ? format_hex_pretty(d).c_str() : "");
+                if (e != canbus::ERROR_OK) ESP_LOGW("bms>inv", "send 0x%03X failed, error %d", (unsigned) can_id, (int) e);
+              }
+      - can_id: 0
+        can_id_mask: 0
+        use_extended_id: true    # 29-bit frames (normally none on PCS), forwarded as-is
+        then:
+          - lambda: |-
+              auto &s = mitm::state();
+              s.last_bms_ms = millis();
+              s.from_bms++;
+              const auto e = id(inverter_can)->send_data(can_id, true, x);
+              if (e != canbus::ERROR_OK) s.tx_errors++;
+              if (id(log_frames).state)
+                ESP_LOGI("bms>inv", "ext 0x%08X %s%s", (unsigned) can_id, format_hex_pretty(x).c_str(),
+                         e != canbus::ERROR_OK ? "  SEND FAILED" : "");
+
+  # ---------------- Inverter side ----------------
+  - platform: esp32_can
+    id: inverter_can
+    tx_pin: ${inv_tx}
+    rx_pin: ${inv_rx}
+    can_id: 0x7FF
+    bit_rate: 500KBPS
+    rx_queue_len: 64
+    tx_queue_len: 64
+    tx_enqueue_timeout: 5ms
+    on_frame:
+      - can_id: 0
+        can_id_mask: 0           # inverter -> BMS (0x305 heartbeat with time), forwarded as-is
+        then:
+          - lambda: |-
+              auto &s = mitm::state();
+              s.last_inv_ms = millis();
+              s.from_inv++;
+              const auto e = id(bms_can)->send_data(can_id, false, x);
+              if (e != canbus::ERROR_OK) s.tx_errors++;
+              if (id(log_frames).state)
+                ESP_LOGI("inv>bms", "0x%03X %s%s", (unsigned) can_id, format_hex_pretty(x).c_str(),
+                         e != canbus::ERROR_OK ? "  SEND FAILED" : "");
+      - can_id: 0
+        can_id_mask: 0
+        use_extended_id: true
+        then:
+          - lambda: |-
+              auto &s = mitm::state();
+              s.last_inv_ms = millis();
+              s.from_inv++;
+              const auto e = id(bms_can)->send_data(can_id, true, x);
+              if (e != canbus::ERROR_OK) s.tx_errors++;
+              if (id(log_frames).state)
+                ESP_LOGI("inv>bms", "ext 0x%08X %s%s", (unsigned) can_id, format_hex_pretty(x).c_str(),
+                         e != canbus::ERROR_OK ? "  SEND FAILED" : "");
+
+# ---------------- Controls ----------------
+switch:
+  - platform: template
+    id: mitm_active
+    name: "MitM active"
+    icon: "mdi:swap-horizontal"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF   # first boot: pure pass-through
+  - platform: template
+    id: voltage_limit_on
+    name: "Limit charge voltage"
+    icon: "mdi:battery-arrow-up"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+  - platform: template
+    id: charging_allowed
+    name: "Charging allowed"
+    icon: "mdi:battery-charging"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+  - platform: template
+    id: discharging_allowed
+    name: "Discharging allowed"
+    icon: "mdi:battery-minus"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+  - platform: template
+    id: log_frames
+    name: "Log CAN frames"
+    icon: "mdi:text-box-search"
+    entity_category: diagnostic
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF   # turn ON only while troubleshooting (~37 log lines/s)
+  - platform: template
+    id: cell_guard_on
+    name: "Cell overvoltage guard"
+    icon: "mdi:shield-alert"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF   # turn on in HA when you want it (needs "MitM active")
+  - platform: template
+    id: low_guard_on
+    name: "Low cell guard"
+    icon: "mdi:battery-alert-variant-outline"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF   # turn OFF for bottom/capacity tests (needs "MitM active")
+  - platform: restart
+    name: "Restart"
+
+number:
+  - platform: template
+    id: max_charge_voltage
+    name: "Max charge voltage"
+    unit_of_measurement: "V"
+    device_class: voltage
+    min_value: 54.0
+    max_value: 58.4
+    step: 0.1
+    initial_value: 56.8          # 3.55 V/cell for 16S LFP
+    optimistic: true
+    restore_value: true
+    mode: box
+  - platform: template
+    id: max_charge_current
+    name: "Max charge current"
+    unit_of_measurement: "A"
+    device_class: current
+    min_value: 0
+    max_value: ${max_current}
+    step: 1
+    initial_value: ${max_current}
+    optimistic: true
+    restore_value: true
+    mode: box
+  - platform: template
+    id: max_discharge_current
+    name: "Max discharge current"
+    unit_of_measurement: "A"
+    device_class: current
+    min_value: 0
+    max_value: ${max_current}
+    step: 1
+    initial_value: ${max_current}
+    optimistic: true
+    restore_value: true
+    mode: box
+
+  - platform: template
+    id: guard_slow_v
+    name: "Guard slow-charge cell voltage"
+    unit_of_measurement: "V"
+    device_class: voltage
+    entity_category: config
+    min_value: 3.40
+    max_value: 3.60
+    step: 0.01
+    initial_value: 3.50
+    optimistic: true
+    restore_value: true
+    mode: box
+  - platform: template
+    id: guard_stop_v
+    name: "Guard stop cell voltage"
+    unit_of_measurement: "V"
+    device_class: voltage
+    entity_category: config
+    min_value: 3.45
+    max_value: 3.62
+    step: 0.01
+    initial_value: 3.57
+    optimistic: true
+    restore_value: true
+    mode: box
+  - platform: template
+    id: guard_resume_v
+    name: "Guard resume cell voltage"
+    unit_of_measurement: "V"
+    device_class: voltage
+    entity_category: config
+    min_value: 3.35
+    max_value: 3.55
+    step: 0.01
+    initial_value: 3.45
+    optimistic: true
+    restore_value: true
+    mode: box
+  - platform: template
+    id: guard_slow_a
+    name: "Guard slow-charge current"
+    unit_of_measurement: "A"
+    device_class: current
+    entity_category: config
+    min_value: 0
+    max_value: 100
+    step: 1
+    initial_value: 8             # TOTAL for all packs (about 2 A per pack with 4 packs) - scale to your pack count
+    optimistic: true
+    restore_value: true
+    mode: box
+
+  # Low cell guard, stepwise. Names are part of the stored-value key: renaming one resets it to initial_value.
+  - platform: template
+    id: low_step1_v
+    name: "Low guard step 1 cell voltage"
+    unit_of_measurement: "V"
+    device_class: voltage
+    entity_category: config
+    min_value: 2.95
+    max_value: 3.25
+    step: 0.01
+    initial_value: 3.10
+    optimistic: true
+    restore_value: true
+    mode: box
+  - platform: template
+    id: low_step1_a
+    name: "Low guard step 1 current"
+    unit_of_measurement: "A"
+    device_class: current
+    entity_category: config
+    min_value: 0
+    max_value: ${max_current}
+    step: 1
+    initial_value: 190           # TOTAL for all packs (about 47 A per pack with 4 packs) - scale to your pack count
+    optimistic: true
+    restore_value: true
+    mode: box
+  - platform: template
+    id: low_slow_v
+    name: "Low guard step 2 cell voltage"
+    unit_of_measurement: "V"
+    device_class: voltage
+    entity_category: config
+    min_value: 2.90
+    max_value: 3.20
+    step: 0.01
+    initial_value: 3.05
+    optimistic: true
+    restore_value: true
+    mode: box
+  - platform: template
+    id: low_slow_a
+    name: "Low guard step 2 current"
+    unit_of_measurement: "A"
+    device_class: current
+    entity_category: config
+    min_value: 0
+    max_value: ${max_current}
+    step: 1
+    initial_value: 40            # TOTAL for all packs (about 10 A per pack with 4 packs); 0 = clean stop at step 2
+    optimistic: true
+    restore_value: true
+    mode: box
+  - platform: template
+    id: low_stop_v
+    name: "Low guard stop cell voltage"
+    unit_of_measurement: "V"
+    device_class: voltage
+    entity_category: config
+    min_value: 2.80
+    max_value: 3.10
+    step: 0.01
+    initial_value: 2.95
+    optimistic: true
+    restore_value: true
+    mode: box
+  - platform: template
+    id: low_resume_v
+    name: "Low guard release cell voltage"
+    unit_of_measurement: "V"
+    device_class: voltage
+    entity_category: config
+    min_value: 3.10
+    max_value: 3.40
+    step: 0.01
+    initial_value: 3.30          # cells rest ~3.26 V at 20 % SOC, ~3.30 V at 30 %: release needs a charge
+    optimistic: true
+    restore_value: true
+    mode: box
+
+# ---------------- Status ----------------
+text_sensor:
+  - platform: template
+    name: "Cell guard state"
+    icon: "mdi:shield-check"
+    update_interval: 5s
+    lambda: return std::string(mitm::guard_name(mitm::state().guard));
+  - platform: template
+    name: "Low cell guard state"
+    icon: "mdi:battery-alert-variant-outline"
+    update_interval: 5s
+    lambda: return std::string(mitm::low_guard_name(mitm::state().low));
+
+interval:
+  - interval: 5s
+    then:
+      - lambda: |-
+          const mitm::Limits L = mitm_limits();
+          mitm::update_guard(L);       // also catches stale cell data
+          mitm::update_low_guard(L);
+  - interval: 10s
+    then:
+      - lambda: |-
+          const auto &s = mitm::state();
+          const uint32_t now = millis();
+          ESP_LOGI("status", "from BMS %u (last %ds ago) | from inverter %u (last %ds ago) | modified %u | send errors %u | BMS CVL %.1f V sent %.1f V",
+                   (unsigned) s.from_bms, s.last_bms_ms ? (int) ((now - s.last_bms_ms) / 1000) : -1,
+                   (unsigned) s.from_inv, s.last_inv_ms ? (int) ((now - s.last_inv_ms) / 1000) : -1,
+                   (unsigned) s.modified, (unsigned) s.tx_errors, s.bms_cvl, s.sent_cvl);
+
+binary_sensor:
+  - platform: template
+    name: "BMS link"
+    device_class: connectivity
+    lambda: return mitm::state().last_bms_ms != 0 && millis() - mitm::state().last_bms_ms < 5000;
+  - platform: template
+    name: "Inverter link"
+    device_class: connectivity
+    lambda: return mitm::state().last_inv_ms != 0 && millis() - mitm::state().last_inv_ms < 5000;
+  - platform: template
+    name: "BMS force charge request"
+    lambda: return mitm::state().bms_force_charge;
+
+sensor:
+  - platform: template
+    name: "Highest cell voltage"
+    unit_of_measurement: "V"
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 3
+    update_interval: 5s
+    lambda: return mitm::state().cell_max;
+  - platform: template
+    name: "Lowest cell voltage"
+    unit_of_measurement: "V"
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 3
+    update_interval: 10s
+    lambda: return mitm::state().cell_min;
+  - platform: template
+    name: "Guard stops"
+    entity_category: diagnostic
+    state_class: total_increasing
+    accuracy_decimals: 0
+    update_interval: 60s
+    lambda: return mitm::state().guard_stops;
+  - platform: template
+    name: "Low guard stops"
+    entity_category: diagnostic
+    state_class: total_increasing
+    accuracy_decimals: 0
+    update_interval: 60s
+    lambda: return mitm::state().low_stops;
+  - platform: template
+    name: "BMS requested charge voltage"
+    unit_of_measurement: "V"
+    device_class: voltage
+    accuracy_decimals: 1
+    update_interval: 10s
+    lambda: return mitm::state().bms_cvl;
+  - platform: template
+    name: "Sent charge voltage"
+    unit_of_measurement: "V"
+    device_class: voltage
+    accuracy_decimals: 1
+    update_interval: 10s
+    lambda: return mitm::state().sent_cvl;
+  - platform: template
+    name: "BMS charge current limit"
+    unit_of_measurement: "A"
+    device_class: current
+    accuracy_decimals: 1
+    update_interval: 10s
+    lambda: return mitm::state().bms_ccl;
+  - platform: template
+    name: "Sent charge current limit"
+    unit_of_measurement: "A"
+    device_class: current
+    accuracy_decimals: 1
+    update_interval: 10s
+    lambda: return mitm::state().sent_ccl;
+  - platform: template
+    name: "BMS discharge current limit"
+    unit_of_measurement: "A"
+    device_class: current
+    accuracy_decimals: 1
+    update_interval: 10s
+    lambda: return mitm::state().bms_dcl;
+  - platform: template
+    name: "Sent discharge current limit"
+    unit_of_measurement: "A"
+    device_class: current
+    accuracy_decimals: 1
+    update_interval: 10s
+    lambda: return mitm::state().sent_dcl;
+  - platform: template
+    name: "Frames from BMS per minute"
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 60s
+    lambda: |-
+      static uint32_t last = 0;
+      const uint32_t n = mitm::state().from_bms, d = n - last;
+      last = n;
+      return d;
+  - platform: template
+    name: "Frames from inverter per minute"
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 60s
+    lambda: |-
+      static uint32_t last = 0;
+      const uint32_t n = mitm::state().from_inv, d = n - last;
+      last = n;
+      return d;
+  - platform: template
+    name: "Modified frames per minute"
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 60s
+    lambda: |-
+      static uint32_t last = 0;
+      const uint32_t n = mitm::state().modified, d = n - last;
+      last = n;
+      return d;
+  - platform: template
+    name: "CAN send errors"
+    entity_category: diagnostic
+    state_class: total_increasing
+    accuracy_decimals: 0
+    update_interval: 60s
+    lambda: return mitm::state().tx_errors;
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    update_interval: 60s
+
+# Optional Home Assistant automation for a periodic full charge (balancing + SOC calibration):
+#   e.g. Sunday 09:00 turn OFF "Limit charge voltage", Sunday 18:00 turn it back ON.

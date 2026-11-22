@@ -24,8 +24,8 @@ and the cell overvoltage guard slows or stops charging when one cell runs ahead.
 **Bottom:** at high discharge current (about 60 A per pack) the cells sag 90–140 mV. Near empty this makes single
 cells dip to ~3.05 V or lower under load, and the BMS then corrects its SOC downwards on some packs but not others,
 so the packs drift apart. The low cell guard trims the discharge current in steps before that happens.
-This help when pack is used at winter time to by for fixed price and sell for higher hourerly cost 
-and a high workround on pack is needed. 
+This helps when the battery is used in winter to buy power at a fixed price and sell it when the hourly price is high,
+which means hard cycling of the packs.
 
 ## What it does
 
